@@ -1,0 +1,138 @@
+name: Practice 7 - Deploy Orders API
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: practice7-dev
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+  AWS_PAGER: ""
+  STACK_NAME: sis3-orders-dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    defaults:
+      run:
+        shell: bash
+        working-directory: sis3-orders
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install -r app/requirements.txt
+
+      - name: Run API tests
+        working-directory: sis3-orders/app
+        run: |
+          test -f tests/test_server.py
+          python -m unittest discover -s tests -v
+
+      - name: Connect to AWS using OIDC
+        id: aws
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          allowed-account-ids: "266294231651"
+
+      - name: Validate CloudFormation template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://infra/application.yaml
+
+      - name: Read ECR repository
+        run: |
+          REPO_URI=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME-registry" \
+            --query "Stacks[0].Outputs[?OutputKey=='RepositoryUri'].OutputValue | [0]" \
+            --output text)
+          test -n "$REPO_URI"
+          test "$REPO_URI" != "None"
+          echo "REPO_URI=$REPO_URI" >> "$GITHUB_ENV"
+          echo "REPO_NAME=${REPO_URI#*/}" >> "$GITHUB_ENV"
+          echo "IMAGE_URI=$REPO_URI:$GITHUB_SHA" >> "$GITHUB_ENV"
+
+      - name: Build and push image
+        run: |
+          aws ecr get-login-password | docker login \
+            --username AWS --password-stdin "${REPO_URI%%/*}"
+          if result=$(aws ecr describe-images \
+            --repository-name "$REPO_NAME" \
+            --image-ids "imageTag=$GITHUB_SHA" 2>&1); then
+            echo "Reusing existing immutable image for this commit."
+          elif [[ "$result" == *ImageNotFoundException* ]]; then
+            docker build --platform linux/amd64 -t "$IMAGE_URI" app
+            docker push "$IMAGE_URI"
+          else
+            echo "$result" >&2
+            exit 1
+          fi
+
+      - name: Deploy through CloudFormation
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$STACK_NAME" \
+            --template-file infra/application.yaml \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides "ImageUri=$IMAGE_URI" \
+            --no-fail-on-empty-changeset
+
+      - name: Verify image and smoke test
+        run: |
+          TASK_DEF=$(aws cloudformation describe-stack-resources \
+            --stack-name "$STACK_NAME" \
+            --query "StackResources[?LogicalResourceId=='ApiTask'].PhysicalResourceId | [0]" \
+            --output text)
+          ACTUAL_IMAGE=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_DEF" \
+            --query "taskDefinition.containerDefinitions[?name=='orders-api'].image | [0]" \
+            --output text)
+          test "$ACTUAL_IMAGE" = "$IMAGE_URI"
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue | [0]" \
+            --output text)
+          curl --fail --silent --show-error --retry 10 --retry-all-errors \
+            --retry-delay 5 --connect-timeout 5 --max-time 15 \
+            "$API_URL/health" | jq -e '.status == "ok"'
+          STATUS=$(curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 \
+            -o /tmp/order-response.json -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -d "{\"orderId\":\"ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT\"}" \
+            "$API_URL/orders")
+          cat /tmp/order-response.json
+          test "$STATUS" = "202"
+          {
+            echo "### Deployment verified"
+            echo "Commit: $GITHUB_SHA"
+            echo "Image: $IMAGE_URI"
+            echo "Task definition: $TASK_DEF"
+            echo "API: $API_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show stack events on failure
+        if: failure() && steps.aws.outcome == 'success'
+        run: |
+          aws cloudformation describe-stack-events \
+            --stack-name "$STACK_NAME" \
+            --max-items 15 --output table
